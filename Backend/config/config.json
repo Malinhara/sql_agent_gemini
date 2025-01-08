@@ -1,0 +1,13 @@
+{
+    "database": {
+        "host": "DESKTOP-266KFRJ",
+        "port": 1433,
+        "user": "",
+        "password": ""
+    },
+    "gpt": {
+        "gpt_api_key": "AIzaSyBe_MvtNfS0IiNp-V16SvYdNVackqISKeY",
+        "temperature": 0.04,
+        "model": "gemini-1.5-flash"
+    }
+}
