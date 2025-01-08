@@ -27,11 +27,11 @@ def show_admin_panel():
         st.subheader("Enter GPT Settings")
         gpt_api_key = st.text_input("GPT API Key", type="password")
         temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.04)
-        model_options = ["gpt-3.5-turbo", "gpt-4", "gpt-4o-mini","gemini-1.5-flash"]
+        model_options = ["gemini-1.5-flash-8b", "gemini-1.5-pro","gemini-1.5-flash"]
         model = st.selectbox("Select GPT Model", model_options)
 
     # Check if all fields are filled
-    all_fields_filled = all([host, port, user, password, gpt_api_key])
+    all_fields_filled = all([host, port,gpt_api_key])
 
     # Save database and GPT details together
     if all_fields_filled and st.button("Save Database and GPT Details"):
