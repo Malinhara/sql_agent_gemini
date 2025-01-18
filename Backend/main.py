@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -74,18 +75,28 @@ DB_CONNECTIONS = {}
 
 # Helper function to create or fetch a DB connection
 def create_db_connection(database: str):
-    if database not in DB_CONNECTIONS:
-        try:
-            # Use the SQL Server URI for connection
-            connection_string = f"mssql+pyodbc://{DATABASE_DETAILS['user']}:{DATABASE_DETAILS['password']}@{DATABASE_DETAILS['host']}:{DATABASE_DETAILS['port']}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
-            
-            # Create and store connection in the global dictionary
-            DB_CONNECTIONS[database] = SQLDatabase.from_uri(connection_string)
+    global DB_CONNECTIONS
+
+    # Check if a connection already exists for the requested database
+    if database in DB_CONNECTIONS:
+        print(f"Using cached connection for database: {database}")
+        return DB_CONNECTIONS[database]
+
+    # Create a new connection if not cached
+    try:
+        connection_string = f"mssql+pyodbc://{DATABASE_DETAILS['user']}:{DATABASE_DETAILS['password']}@" \
+                            f"{DATABASE_DETAILS['host']}:{DATABASE_DETAILS['port']}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
         
-        except SQLAlchemyError as e:
-            raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
-    
-    return DB_CONNECTIONS[database]
+        # Create a new database connection
+        db = SQLDatabase.from_uri(connection_string)
+        
+        # Cache the new connection
+        DB_CONNECTIONS[database] = db
+        print(f"Created new connection for database: {database}")
+        return db
+
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
 
 
 # Helper function to setup the Google LLM (replacing OpenAI with Google LLM)
@@ -194,8 +205,6 @@ For the following query request:
 2. Generate a SQL query using these tables and schemas. Ensure that schema names are included in the SQL.
 3. Provide an example of the expected results (e.g., the first 5 rows).
 
-Previous Queries and Responses:
-{history}
 
 Current Query: {query}
 
@@ -205,46 +214,72 @@ Example Data:
 """
 
 
+
 # Endpoint to convert natural language query to SQL and execute it
 @app.post("/convert-nl-to-sql-and-execute-with-validation/")
 async def convert_nl_to_sql_and_execute_with_validation(query_data: QueryHistory):
     try:
         # Step 1: Create DB connection with the specified database
         db = create_db_connection(query_data.database)
-
+        
         # Step 2: Setup GPT model (Google LLM)
         llm = setup_llm()
         
         # Step 3: Generate SQL query using LangChain agent
-        prompt = PromptTemplate(input_variables=["history", "query"], template=prompt_template)
-        toolkit = SQLDatabaseToolkit(db=db, llm=llm)  #add your schemas names
+        prompt = PromptTemplate(input_variables=["query"], template=prompt_template)
+        toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
         # Initialize the agent executor
         try:
             agent_executor = create_sql_agent(
                 llm=llm,
-                toolkit=toolkit,  # Pass the toolkit
-                agent_type=AgentType.OPENAI_FUNCTIONS,  # Specify agent type
-                top_k=2  # Adjust for performance
+                toolkit=toolkit,
+                agent_type=AgentType.OPENAI_FUNCTIONS,
+                top_k=2
             )
         except Exception as init_error:
             raise HTTPException(status_code=500, detail=f"Failed to initialize agent: {str(init_error)}")
 
         # Format the prompt with history and the current query
-        query_history = "\n".join([f"Query: {entry['query']}\nResponse: {entry['response']}" for entry in query_data.history])
-        formatted_prompt = prompt.format(
-            history=query_history,
-            query=query_data.query 
-        )
+        formatted_prompt = prompt.format(query=query_data.query)
 
-        # Generate SQL query
+        # Generate and execute SQL query
         try:
-            sql_query = agent_executor.invoke(formatted_prompt)
-        except Exception as execution_error:
-            raise HTTPException(status_code=500, detail=f"Agent execution error: {str(execution_error)}")
+            # Get the response from the agent
+            response = agent_executor.invoke(formatted_prompt)
+            
+            # Extract the response text
+            response_text = response.get("output", "")
+            
+            # Extract SQL query using regex
+            sql_match = re.search(r"SQL Query:.*?```sql\s*(.*?)\s*```", response_text, re.DOTALL)
+            if not sql_match:
+                # Try alternative pattern without ```sql
+                sql_match = re.search(r"SQL Query:\s*(.*?)(?=Example Data:|$)", response_text, re.DOTALL)
+            
+            if not sql_match:
+                raise HTTPException(status_code=500, detail="Could not extract SQL query from response")
+            
+            # Clean up the extracted SQL query
+            sql_query = sql_match.group(1).strip()
+            print(f"Extracted SQL Query: {sql_query}")
+            
+            # Execute the SQL query
+            result = db.run(sql_query)
+            print(f"Query Execution Result: {result}")
+            
+            # Combine all results into a single object
+            combined_response = {
+                "response": response_text,
+                "sql_query": sql_query,
+                "execution_result": result
+            }
 
-        # Return the generated SQL query
-        return {"response": sql_query}
+            # Return the combined response
+            return combined_response
+            
+        except Exception as execution_error:
+            raise HTTPException(status_code=500, detail=f"Execution error: {str(execution_error)}")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing the request: {str(e)}")
