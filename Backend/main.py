@@ -1,41 +1,37 @@
-import os
-import json
-import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from langchain_community.utilities.sql_database import SQLDatabase
+from langchain.chains import create_sql_query_chain
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
-from langchain_community.agent_toolkits.sql.base import create_sql_agent
-from langchain.agents.agent_types import AgentType
-from langchain.prompts import PromptTemplate
-from typing import Optional
-from langchain_community.utilities import SQLDatabase
+from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from operator import itemgetter
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from sqlalchemy.exc import SQLAlchemyError
+import os
+import json
 
-# Load environment variables from a .env file
-load_dotenv()
-
-# FastAPI instance
+# Initialize FastAPI app
 app = FastAPI()
 
-# CORS Middleware configuration from environment variable
-origins_env = os.getenv("ORIGINS")
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins='http://localhost:8501',  # Uses the origins list loaded from the environment variable
+    allow_origins=["http://localhost:8501"],  # Allow specific origins
     allow_credentials=True,
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
 )
 
-# Pydantic models for request validation
+
+# Models for request and response
 class QueryHistory(BaseModel):
     query: str
     database: str  # User specifies the database name here
-    history: Optional[list[dict]] = []
 
 class DatabaseDetails(BaseModel):
     host: str
@@ -47,19 +43,26 @@ class GPTSettings(BaseModel):
     gpt_api_key: str
     temperature: float
     model: str
-
+    
 class Settings(BaseModel):
     database: DatabaseDetails
     gpt: GPTSettings
+    
+    
 
-# Config file path
+
+class QueryResponse(BaseModel):
+    answer: str
+
+# Configuration
 CONFIG_FILE_PATH = "config/config.json"
 
-# Global variable to hold database and GPT settings
+# Global variables for configuration
 DATABASE_DETAILS = {}
 GPT_SETTINGS = {}
+DB_CONNECTIONS = {}
 
-# Helper function to load config from a file
+# Helper function to load configuration
 def load_config():
     global DATABASE_DETAILS, GPT_SETTINGS
     if os.path.exists(CONFIG_FILE_PATH):
@@ -71,221 +74,75 @@ def load_config():
 # Load configuration on startup
 load_config()
 
-DB_CONNECTIONS = {}
+# Database connection function
+def get_database(database: str):
+    if database not in DB_CONNECTIONS:
+        try:
+            # Use the SQL Server URI for connection
+            connection_string = f"mssql+pyodbc://{DATABASE_DETAILS['user']}:{DATABASE_DETAILS['password']}@{DATABASE_DETAILS['host']}:{DATABASE_DETAILS['port']}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
+            
+            # Create and store connection in the global dictionary
+            DB_CONNECTIONS[database] = SQLDatabase.from_uri(connection_string)
+        
+        except SQLAlchemyError as e:
+            raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
+    
+    return DB_CONNECTIONS[database]
 
-# Helper function to create or fetch a DB connection
-def create_db_connection(database: str):
-    global DB_CONNECTIONS
 
-    # Check if a connection already exists for the requested database
-    if database in DB_CONNECTIONS:
-        print(f"Using cached connection for database: {database}")
-        return DB_CONNECTIONS[database]
+# GPT Initialization
+api_key = GPT_SETTINGS.get("gpt_api_key", "")
+llm = ChatGoogleGenerativeAI(
+    model=GPT_SETTINGS.get("model", "chat-bison"),
+    temperature=GPT_SETTINGS.get("temperature", 0),
+    api_key=api_key,
+    streaming=False,
+)
 
-    # Create a new connection if not cached
+# Answer Rephrasing Pipeline
+answer_prompt = PromptTemplate.from_template(
+    """Given the following user question, corresponding SQL query, and SQL result, answer the user question.
+
+    Question: {question}
+    SQL Query: {query}
+    SQL Result: {result}
+    Answer: """
+)
+rephrase_answer = answer_prompt | llm | StrOutputParser()
+
+@app.post("/ask", response_model=QueryResponse)
+def ask_question(query_data: QueryHistory):
+    """Handle a natural language query against the specified database."""
     try:
-        connection_string = f"mssql+pyodbc://{DATABASE_DETAILS['user']}:{DATABASE_DETAILS['password']}@" \
-                            f"{DATABASE_DETAILS['host']}:{DATABASE_DETAILS['port']}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
-        
-        # Create a new database connection
-        db = SQLDatabase.from_uri(connection_string)
-        
-        # Cache the new connection
-        DB_CONNECTIONS[database] = db
-        print(f"Created new connection for database: {database}")
-        return db
+        # Connect to the specified database
+        db = get_database(query_data.database)
+        print(db)
 
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=f"Database connection error: {str(e)}")
+        # Initialize query generator and executor
+        generate_query = create_sql_query_chain(llm, db)
+        execute_query = QuerySQLDataBaseTool(db=db)
 
+        # Generate SQL query from the natural language question
+        query = generate_query.invoke({"question": query_data.query})
 
-# Helper function to setup the Google LLM (replacing OpenAI with Google LLM)
-def setup_llm():
-    try:
-        # Ensure GPT settings are loaded
-        if not GPT_SETTINGS:
-            raise HTTPException(status_code=500, detail="GPT settings not configured.")
-        
-        api_key = GPT_SETTINGS['gpt_api_key']
-        if not api_key:
-            raise HTTPException(status_code=500, detail="Google API key is not set in configuration.")
-        
-        # Use Google LLM instead of OpenAI LLM
-        return ChatGoogleGenerativeAI(
-            model=GPT_SETTINGS['model'],
-            temperature=GPT_SETTINGS['temperature'],
-            api_key=api_key,
-            streaming=False  # Disable streaming for faster responses
+        # Execute the generated SQL query
+        result = execute_query.invoke(query)
+
+        # Generate a natural language answer
+        answer = rephrase_answer.invoke({
+            "question": query_data.query,
+            "query": query,
+            "result": result
+        })
+
+        return QueryResponse(
+            answer=answer
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error initializing Google LLM: {str(e)}")
-
-# SQL prompt template
-
-prompt_template = """
-You are a SQL expert with access to the following tables: 
-
-1. BusinessRule:
-   - Id
-   - RuleSetId
-   - BanType
-   - MultipleLOB
-   - InteractionChannel
-   - Tile
-   - TargetPages
-   - TilePosition
-   - LOB
-   - BUPID
-   - UseCase
-   - StartDate
-   - EndDate
-   - Days
-   - Product
-   - PackagePlan
-   - Other
-   - TilePriority
-   - PrioritySource
-   - Remarks
-   - OfferID
-   - ServiceID
-   - AccountID
-   - Language
-   - Province
-   - SuppressTile
-   - IsDisabled
-   - StartDateDt
-   - EndDateDt
-   - IsExpired
-
-2. Tile:
-   - TileID
-   - TileName
-   - TileCategory
-   - Brand
-   - DateModified
-   - DateCreated
-   - US_ID
-   - Style
-   - TileType
-   - TileTactic
-   - TileSubCategory
-   - OfferType
-   - ProductOffering
-   - Origin
-   - UserStory
-   - JiraStoryId
-   - RequestorName
-   - Title_En
-   - Title_Fr
-   - LinkUrl_En
-   - LinkUrl_Fr
-   - Body_En
-   - Body_Fr
-   - ShowRatingsIcons
-   - ModelCategory
-   - LightboxActive
-   - LB_Start
-   - LB_End
-   - Campaign_ID
-   - SelfServeFlag
-   - CallType
-   - TargetGroup
-   - Omniture_Start_Page
-   - Omniture_End_Page
-   - CreatedBy
-   - IsLocal
-   - CTA_Type
-   - Protected_Tile_ODM_Guard
-   - Modified_By
-   - Modified_By_Person
-
-For the following query request:
-
-1. Provide a brief explanation of the query's purpose.
-2. Generate a SQL query using these tables and schemas. Ensure that schema names are included in the SQL.
-3. Provide an example of the expected results (e.g., the first 5 rows).
-
-
-Current Query: {query}
-
-Explanation:
-SQL Query:
-Example Data:
-"""
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 
-# Endpoint to convert natural language query to SQL and execute it
-@app.post("/convert-nl-to-sql-and-execute-with-validation/")
-async def convert_nl_to_sql_and_execute_with_validation(query_data: QueryHistory):
-    try:
-        # Step 1: Create DB connection with the specified database
-        db = create_db_connection(query_data.database)
-        
-        # Step 2: Setup GPT model (Google LLM)
-        llm = setup_llm()
-        
-        # Step 3: Generate SQL query using LangChain agent
-        prompt = PromptTemplate(input_variables=["query"], template=prompt_template)
-        toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-
-        # Initialize the agent executor
-        try:
-            agent_executor = create_sql_agent(
-                llm=llm,
-                toolkit=toolkit,
-                agent_type=AgentType.OPENAI_FUNCTIONS,
-                top_k=2
-            )
-        except Exception as init_error:
-            raise HTTPException(status_code=500, detail=f"Failed to initialize agent: {str(init_error)}")
-
-        # Format the prompt with history and the current query
-        formatted_prompt = prompt.format(query=query_data.query)
-
-        # Generate and execute SQL query
-        try:
-            # Get the response from the agent
-            response = agent_executor.invoke(formatted_prompt)
-            
-            # Extract the response text
-            response_text = response.get("output", "")
-            
-            # Extract SQL query using regex
-            sql_match = re.search(r"SQL Query:.*?```sql\s*(.*?)\s*```", response_text, re.DOTALL)
-            if not sql_match:
-                # Try alternative pattern without ```sql
-                sql_match = re.search(r"SQL Query:\s*(.*?)(?=Example Data:|$)", response_text, re.DOTALL)
-            
-            if not sql_match:
-                raise HTTPException(status_code=500, detail="Could not extract SQL query from response")
-            
-            # Clean up the extracted SQL query
-            sql_query = sql_match.group(1).strip()
-            print(f"Extracted SQL Query: {sql_query}")
-            
-            # Execute the SQL query
-            result = db.run(sql_query)
-            print(f"Query Execution Result: {result}")
-            
-            # Combine all results into a single object
-            combined_response = {
-                "response": response_text,
-                "sql_query": sql_query,
-                "execution_result": result
-            }
-
-            # Return the combined response
-            return combined_response
-            
-        except Exception as execution_error:
-            raise HTTPException(status_code=500, detail=f"Execution error: {str(execution_error)}")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing the request: {str(e)}")
-
-
-# Endpoint to save database and GPT configuration in one request
 @app.post("/save-config-details")
 async def save_config_details(settings: Settings):
     try:
@@ -379,4 +236,7 @@ async def list_tables(database: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing the request: {str(e)}")
     
-    
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
