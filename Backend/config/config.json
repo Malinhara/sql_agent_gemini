@@ -6,8 +6,8 @@
         "password": ""
     },
     "gpt": {
-        "gpt_api_key": "AIzaSyBe_MvtNfS0IiNp-V16SvYdNVackqISKeY",
+        "gpt_api_key": "",
         "temperature": 0.04,
-        "model": "gemini-1.5-flash"
+        "model": "gemini-1.5-pro"
     }
 }
