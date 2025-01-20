@@ -113,92 +113,56 @@ if not st.session_state.databases or not st.session_state.selected_db or not st.
 
 
 
-# Home - Chatbot Page
-MAX_CHAT_HISTORY = 20
-
 # Display chat messages from trimmed history
 if app_mode == "Home - Chatbot":
     st.title("Natural Language to SQL")
 
-    # Retain the latest messages based on the MAX_CHAT_HISTORY constant
-    trimmed_history = st.session_state.messages[-MAX_CHAT_HISTORY:]  # Limit history size
-    for message in trimmed_history:
+    # Display chat messages from history
+    for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
     # Accept user input
     user_input = st.chat_input("Type your question here...")
-
     if user_input:
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": user_input})
-
-        # Display user message in the chat
         with st.chat_message("user"):
             st.markdown(user_input)
 
         # Send request to FastAPI and display "thinking..." response
         with st.chat_message("assistant"):
-            # Ensure message_placeholder is created only once and persists until the new response is available
-            message_placeholder = st.empty()  # Placeholder for assistant's response
-
-            # Display a loading message while waiting for the response
-            message_placeholder.markdown("**Assistant is thinking...**")
-
-            # Initialize bot response
+            message_placeholder = st.empty()
             bot_response = ""  # Initialize bot response
 
             try:
-                # Prepare payload for FastAPI
                 payload = {"query": user_input, "database": st.session_state.selected_db}
-                response = requests.post(f"{FASTAPI_URL}/convert-nl-to-sql-and-execute-with-validation/", json=payload)
+                response = requests.post(f"{FASTAPI_URL}/ask", json=payload)
 
                 if response.status_code == 200:
-                    response_data = response.json()
+                    try:
+                        response_data = response.json()  # Parse JSON response
 
-                    # Extract the bot response, SQL query, and execution result from the backend
-                    bot_response = response_data.get("response", "Sorry, I couldn't understand.")
-                    sql_query = response_data.get("sql_query", "No SQL query was generated.")
-                    execution_result = response_data.get("execution_result", "No result returned from the database.")
+                        # Ensure the response is a string, not a dict
+                        if isinstance(response_data, dict):
+                            bot_response = response_data.get("answer", "Sorry, I couldn't understand.")
+                        else:
+                            bot_response = "Unexpected response format from the server."
+                    except ValueError:
+                        bot_response = "Error: Could not parse the response from the server."
 
-                    # Format the response for markdown display
-                    formatted_response = f"""
-                    **Bot Response:**
-                    {bot_response}
-
-                    **Generated SQL Query:**
-                    ```sql
-                    {sql_query}
-                    ```
-
-                    **Execution Result:**
-                    ```json
-                    {execution_result}
-                    ```
-                    """
-                    # Show formatted response in the chat
-                    message_placeholder.markdown(formatted_response)
-
-                    # Save assistant's response and trim chat history
-                    st.session_state.messages.append({"role": "assistant", "content": formatted_response})
-
-                    # Trim the chat history to maintain the latest messages up to the MAX_CHAT_HISTORY limit
-                    st.session_state.messages = st.session_state.messages[-MAX_CHAT_HISTORY:]
+                    # Display bot response
+                    message_placeholder.markdown(bot_response)
                 else:
-                    # Handle non-200 HTTP responses
-                    error_message = f"Error: {response.status_code} - {response.reason}"
-                    message_placeholder.markdown(error_message)
+                    bot_response = f"Error: {response.status_code} - Unable to get response from FastAPI server."
+                    st.error(bot_response)
 
             except Exception as e:
-                bot_response = f"Error: {e}"
+                bot_response = f"An error occurred: {str(e)}"
                 st.error(bot_response)
 
-            # Save assistant's response and trim chat history
+            # Save assistant's response in the chat history
             st.session_state.messages.append({"role": "assistant", "content": bot_response})
-
-            # Trim the chat history to maintain the latest messages up to the MAX_CHAT_HISTORY limit
-            st.session_state.messages = st.session_state.messages[-MAX_CHAT_HISTORY:]
-
 
 # Admin Panel
 elif app_mode == "Admin Panel":
