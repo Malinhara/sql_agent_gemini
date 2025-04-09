@@ -101,13 +101,35 @@ llm = ChatGoogleGenerativeAI(
 
 # Answer Rephrasing Pipeline
 answer_prompt = PromptTemplate.from_template(
-    """Given the following user question, corresponding SQL query, and SQL result, answer the user question.
+    """
+You are a data analyst assistant. Given a user question, the corresponding SQL query, and the result of that query, perform the following:
 
-    Question: {question}
-    SQL Query: {query}
-    SQL Result: {result}
-    Answer: """
+1. Answer the user's question clearly and concisely.
+2. Provide any relevant past analysis (e.g., patterns, trends, anomalies).
+3. Predict future behavior or trends if possible, based on the result.
+
+Use reasoning and insights based on the data result to add context or business intelligence.
+
+---
+
+Question:
+{question}
+
+SQL Query:
+{query}
+
+SQL Result:
+{result}
+
+---
+
+Answer:
+- Direct Answer: 
+- Past Analysis: 
+- Future Projection: 
+"""
 )
+
 rephrase_answer = answer_prompt | llm | StrOutputParser()
 
 @app.post("/ask", response_model=QueryResponse)
@@ -124,9 +146,17 @@ def ask_question(query_data: QueryHistory):
 
         # Generate SQL query from the natural language question
         query = generate_query.invoke({"question": query_data.query})
+        print(f"Raw generated query:\n{query}")
 
-        # Execute the generated SQL query
+        # 🔧 Clean up backticks and markdown formatting
+        if "```" in query:
+            query = query.replace("```sql", "").replace("```", "").strip()
+
+        print(f"Cleaned SQL Query:\n{query}")
+
+        # Execute the cleaned SQL query
         result = execute_query.invoke(query)
+        print(f"Execution result:\n{result}")
 
         # Generate a natural language answer
         answer = rephrase_answer.invoke({
@@ -134,10 +164,10 @@ def ask_question(query_data: QueryHistory):
             "query": query,
             "result": result
         })
+        print(f"Final Answer:\n{answer}")
 
-        return QueryResponse(
-            answer=answer
-        )
+        return QueryResponse(answer=answer)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
@@ -239,4 +269,4 @@ async def list_tables(database: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
